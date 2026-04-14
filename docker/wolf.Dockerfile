@@ -32,7 +32,7 @@ RUN apt-get update -y && \
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 ENV PATH="$HOME/.cargo/bin:${PATH}"
 
-ARG RUST_VERSION=1.91.1
+ARG RUST_VERSION=1.92.0
 ENV RUST_VERSION=$RUST_VERSION
 RUN rustup install $RUST_VERSION && rustup default $RUST_VERSION
 
@@ -44,10 +44,14 @@ RUN <<_GST_WAYLAND_DISPLAY
     git clone https://github.com/games-on-whales/gst-wayland-display
     cd gst-wayland-display
     git checkout 67b1183
-    # Pinned to 0.10.20: 0.10.21+ requires rustc 1.92, upgrade RUST_VERSION above if unpinning
-    cargo install cargo-c@0.10.20 --locked
+    cargo install cargo-c
     cargo cinstall --features="cuda" --prefix=/usr/local/lib/x86_64-linux-gnu/ --libdir=/usr/local/lib/x86_64-linux-gnu/gstreamer-1.0
 _GST_WAYLAND_DISPLAY
+
+# Cairo for party overlay rendering (installed after Rust stage to preserve cache)
+RUN apt-get update -y && \
+    apt-get install -y --no-install-recommends libcairo2-dev && \
+    rm -rf /var/lib/apt/lists/*
 
 COPY . /wolf/
 WORKDIR /wolf

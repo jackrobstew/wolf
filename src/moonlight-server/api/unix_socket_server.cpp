@@ -321,6 +321,107 @@ UnixSocketServer::UnixSocketServer(boost::asio::io_context &io_context,
        .handler = [this](auto req, auto socket) { endpoint_DockerPullImage(req, socket); }});
 
   /**
+   * Controller Hub
+   */
+  state_->http.add(HTTPMethod::POST,
+                   "/api/v1/hub/create",
+                   {.summary = "Create a Controller Hub with virtual controller slots",
+                    .request_description = APIDescription{.json_schema = rfl::json::to_schema<HubCreateRequest>()},
+                    .response_description = {{200, {.json_schema = rfl::json::to_schema<HubCreateResponse>()}},
+                                             {500, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}}},
+                    .handler = [this](auto req, auto socket) { endpoint_HubCreate(req, socket); }});
+
+  state_->http.add(HTTPMethod::POST,
+                   "/api/v1/hub/pair",
+                   {.summary = "Pair a physical controller to a virtual slot",
+                    .request_description = APIDescription{.json_schema = rfl::json::to_schema<HubPairRequest>()},
+                    .response_description = {{200, {.json_schema = rfl::json::to_schema<GenericSuccessResponse>()}},
+                                             {400, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}}},
+                    .handler = [this](auto req, auto socket) { endpoint_HubPair(req, socket); }});
+
+  state_->http.add(HTTPMethod::POST,
+                   "/api/v1/hub/unpair",
+                   {.summary = "Unpair a virtual slot",
+                    .request_description = APIDescription{.json_schema = rfl::json::to_schema<HubUnpairRequest>()},
+                    .response_description = {{200, {.json_schema = rfl::json::to_schema<GenericSuccessResponse>()}}},
+                    .handler = [this](auto req, auto socket) { endpoint_HubUnpair(req, socket); }});
+
+  state_->http.add(HTTPMethod::POST,
+                   "/api/v1/hub/route",
+                   {.summary = "Route a slot to a different target session",
+                    .request_description = APIDescription{.json_schema = rfl::json::to_schema<HubRouteRequest>()},
+                    .response_description = {{200, {.json_schema = rfl::json::to_schema<GenericSuccessResponse>()}},
+                                             {400, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}}},
+                    .handler = [this](auto req, auto socket) { endpoint_HubRoute(req, socket); }});
+
+  state_->http.add(HTTPMethod::POST,
+                   "/api/v1/hub/swap",
+                   {.summary = "Swap two controller slot pairings",
+                    .request_description = APIDescription{.json_schema = rfl::json::to_schema<HubSwapRequest>()},
+                    .response_description = {{200, {.json_schema = rfl::json::to_schema<GenericSuccessResponse>()}},
+                                             {400, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}}},
+                    .handler = [this](auto req, auto socket) { endpoint_HubSwap(req, socket); }});
+
+  state_->http.add(HTTPMethod::GET,
+                   "/api/v1/hub/status",
+                   {.summary = "Get Controller Hub status",
+                    .description = "Returns all slots, pairings, and unpaired controllers. "
+                                   "Pass session_id as query parameter.",
+                    .response_description = {{200, {.json_schema = rfl::json::to_schema<HubStatusResponse>()}},
+                                             {404, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}}},
+                    .handler = [this](auto req, auto socket) { endpoint_HubStatus(req, socket); }});
+
+  /**
+   * Party Mode
+   */
+  state_->http.add(HTTPMethod::POST,
+                   "/api/v1/party/start",
+                   {.summary = "Start party mode compositor",
+                    .request_description = APIDescription{.json_schema = rfl::json::to_schema<PartyStartRequest>()},
+                    .response_description = {{200, {.json_schema = rfl::json::to_schema<GenericSuccessResponse>()}},
+                                             {500, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}}},
+                    .handler = [this](auto req, auto socket) { endpoint_PartyStart(req, socket); }});
+
+  state_->http.add(HTTPMethod::POST,
+                   "/api/v1/party/stop",
+                   {.summary = "Stop party mode compositor",
+                    .request_description = APIDescription{.json_schema = rfl::json::to_schema<StreamSessionStopRequest>()},
+                    .response_description = {{200, {.json_schema = rfl::json::to_schema<GenericSuccessResponse>()}},
+                                             {400, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}}},
+                    .handler = [this](auto req, auto socket) { endpoint_PartyStop(req, socket); }});
+
+  state_->http.add(HTTPMethod::GET,
+                   "/api/v1/party/status",
+                   {.summary = "Get party mode status",
+                    .description = "Returns whether party mode is active, the layout, and lobby IDs. "
+                                   "Pass session_id as query parameter.",
+                    .response_description = {{200, {.json_schema = rfl::json::to_schema<PartyStatusResponse>()}},
+                                             {404, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}}},
+                    .handler = [this](auto req, auto socket) { endpoint_PartyStatus(req, socket); }});
+
+  state_->http.add(HTTPMethod::POST,
+                   "/api/v1/party/spawn",
+                   {.summary = "One-click party mode: create lobbies, start compositor, switch stream",
+                    .description = "Creates N lobbies (one per player), starts the video compositor, "
+                                   "and switches the Moonlight stream to the composited output.",
+                    .request_description = APIDescription{.json_schema = rfl::json::to_schema<PartySpawnRequest>()},
+                    .response_description = {{200, {.json_schema = rfl::json::to_schema<PartySpawnResponse>()}},
+                                             {400, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}},
+                                             {500, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}}},
+                    .handler = [this](auto req, auto socket) { endpoint_PartySpawn(req, socket); }});
+
+  state_->http.add(HTTPMethod::POST,
+                   "/api/v1/party/focus",
+                   {.summary = "Set which party slot receives mouse/keyboard input",
+                    .description = "Routes the selected stream session's pointer/keyboard/touch input "
+                                   "to a specific active party lobby slot.",
+                    .request_description = APIDescription{.json_schema = rfl::json::to_schema<PartyFocusRequest>()},
+                    .response_description = {{200, {.json_schema = rfl::json::to_schema<PartyFocusResponse>()}},
+                                             {400, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}},
+                                             {404, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}}},
+                    .handler = [this](auto req, auto socket) { endpoint_PartyFocus(req, socket); }});
+
+  /**
    * OpenAPI schema
    */
 

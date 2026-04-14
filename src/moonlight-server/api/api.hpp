@@ -174,6 +174,108 @@ struct DockerPullImageResponse {
   bool success = true;
 };
 
+/**
+ * Controller Hub API types
+ */
+struct HubCreateRequest {
+  int num_slots = 4;
+  std::string session_id; // The Moonlight session that owns the hub
+};
+
+struct HubCreateResponse {
+  bool success = true;
+  int num_slots;
+};
+
+struct HubPairRequest {
+  std::string session_id;
+  int controller_number; // Moonlight controller index
+  int slot_number;       // 1-based slot
+};
+
+struct HubUnpairRequest {
+  std::string session_id;
+  int slot_number;
+};
+
+struct HubRouteRequest {
+  std::string session_id;
+  int slot_number;
+  std::string target_session_id;
+};
+
+struct HubSwapRequest {
+  std::string session_id;
+  int slot_a;
+  int slot_b;
+};
+
+struct HubSlotInfo {
+  int slot_number;
+  std::optional<int> paired_controller;
+  std::string target_session_id;
+  bool physical_connected;
+};
+
+struct HubStatusResponse {
+  bool success = true;
+  std::vector<HubSlotInfo> slots;
+  std::vector<int> unpaired_controllers;
+  std::vector<int> active_controllers; // controllers with input in last 500ms
+};
+
+/**
+ * Party Mode API types
+ */
+struct PartyStartRequest {
+  std::string session_id;
+  std::vector<std::string> lobby_ids;
+  std::string layout; // "2p", "3p", "4p"
+};
+
+struct PartyStatusResponse {
+  bool success = true;
+  bool active = false;
+  std::string layout;
+  std::string tile_aspect;
+  std::vector<std::string> lobby_ids;
+  int focused_slot = 1;
+};
+
+/**
+ * Party Spawn API types — one-click party mode
+ */
+struct PartyPlayerConfig {
+  std::string profile_id;
+  std::string app_title;
+};
+
+struct PartySpawnRequest {
+  std::string session_id;
+  std::string layout;
+  std::vector<PartyPlayerConfig> players;
+  bool adaptive = false; // true: lobbies render at tile resolution (fills screen). false: 1080p + letterbox.
+  std::string tile_aspect = "16:9"; // "16:9" (default) or "4:3" (retro — tiles constrained to 4:3)
+  int controllers_per_player = 1; // 1 = one controller per lobby (default). 2+ = local splitscreen per lobby.
+};
+
+struct PartySpawnResponse {
+  bool success = true;
+  std::vector<std::string> lobby_ids;
+};
+
+struct PartyFocusRequest {
+  int slot_number = 1;                     // 1-based slot index in active party layout
+  std::optional<std::string> session_id;   // optional stream session to retarget; defaults to active session
+};
+
+struct PartyFocusResponse {
+  bool success = true;
+  std::string session_id;
+  int focused_slot = 1;
+  std::string lobby_id;
+};
+
 struct UnixSocket {
   boost::asio::local::stream_protocol::socket socket;
   bool is_alive = true;
@@ -224,6 +326,19 @@ private:
   void endpoint_GetIcon(const HTTPRequest &req, std::shared_ptr<UnixSocket> socket);
   void endpoint_DockerInspectImage(const HTTPRequest &req, std::shared_ptr<UnixSocket> socket);
   void endpoint_DockerPullImage(const HTTPRequest &req, std::shared_ptr<UnixSocket> socket);
+
+  void endpoint_HubCreate(const HTTPRequest &req, std::shared_ptr<UnixSocket> socket);
+  void endpoint_HubPair(const HTTPRequest &req, std::shared_ptr<UnixSocket> socket);
+  void endpoint_HubUnpair(const HTTPRequest &req, std::shared_ptr<UnixSocket> socket);
+  void endpoint_HubRoute(const HTTPRequest &req, std::shared_ptr<UnixSocket> socket);
+  void endpoint_HubSwap(const HTTPRequest &req, std::shared_ptr<UnixSocket> socket);
+  void endpoint_HubStatus(const HTTPRequest &req, std::shared_ptr<UnixSocket> socket);
+
+  void endpoint_PartyStart(const HTTPRequest &req, std::shared_ptr<UnixSocket> socket);
+  void endpoint_PartyStop(const HTTPRequest &req, std::shared_ptr<UnixSocket> socket);
+  void endpoint_PartyStatus(const HTTPRequest &req, std::shared_ptr<UnixSocket> socket);
+  void endpoint_PartySpawn(const HTTPRequest &req, std::shared_ptr<UnixSocket> socket);
+  void endpoint_PartyFocus(const HTTPRequest &req, std::shared_ptr<UnixSocket> socket);
 
   void sse_broadcast(const std::string &payload);
   void sse_keepalive(const boost::system::error_code &e);

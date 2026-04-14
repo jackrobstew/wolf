@@ -1,10 +1,13 @@
 #include "state/sessions.hpp"
 
+#include <algorithm>
 #include <boost/endian/conversion.hpp>
 #include <boost/locale.hpp>
+#include <control/controller_hub.hpp>
 #include <control/input_handler.hpp>
 #include <events/events.hpp>
 #include <helpers/logger.hpp>
+#include <streaming/session_overlay.hpp>
 #include <immer/box.hpp>
 #include <platforms/input.hpp>
 #include <string>
@@ -82,7 +85,7 @@ std::shared_ptr<events::JoypadTypes> create_new_joypad(const events::StreamSessi
               controller_number,
               session.session_id);
     auto result =
-        XboxOneJoypad::create({.name = "Wolf X-Box One (virtual) pad",
+        XboxOneJoypad::create({.name = "Wolf X-Box One (virtual) pad " + std::to_string(controller_number),
                                // https://github.com/torvalds/linux/blob/master/drivers/input/joystick/xpad.c#L147
                                .vendor_id = 0x045E,
                                .product_id = 0x02EA,
@@ -99,7 +102,7 @@ std::shared_ptr<events::JoypadTypes> create_new_joypad(const events::StreamSessi
   case wolf::config::ControllerType::PS: {
     logs::log(logs::info, "Creating PS joypad for controller {}", controller_number);
     auto result = PS5Joypad::create(
-        {.name = "Wolf DualSense (virtual) pad", .vendor_id = 0x054C, .product_id = 0x0CE6, .version = 0x8111});
+        {.name = "Wolf DualSense (virtual) pad " + std::to_string(controller_number), .vendor_id = 0x054C, .product_id = 0x0CE6, .version = 0x8111});
     if (!result) {
       logs::log(logs::error, "Failed to create PS5 joypad: {}", result.getErrorMessage());
       return {};
@@ -128,7 +131,7 @@ std::shared_ptr<events::JoypadTypes> create_new_joypad(const events::StreamSessi
   }
   case wolf::config::ControllerType::NINTENDO:
     logs::log(logs::info, "Creating Nintendo joypad for controller {}", controller_number);
-    auto result = SwitchJoypad::create({.name = "Wolf Nintendo (virtual) pad",
+    auto result = SwitchJoypad::create({.name = "Wolf Nintendo (virtual) pad " + std::to_string(controller_number),
                                         // https://github.com/torvalds/linux/blob/master/drivers/hid/hid-ids.h#L981
                                         .vendor_id = 0x057e,
                                         .product_id = 0x2009,
@@ -346,8 +349,126 @@ void keyboard_key(const KEYBOARD_PACKET &pkt, events::StreamSession &session) {
   // moonlight always sets the high bit; not sure why but mask it off here
   short moonlight_key = (short)boost::endian::little_to_native(pkt.key_code) & (short)0x7fff;
 
+  // ── Party overlay keyboard shortcuts (checked BEFORE keyboard device check,
+  //    because the virtual keyboard may not be ready yet during party reconnect) ──
+  if (pkt.type == KEY_PRESS) {
+    if (moonlight_key == 0x70) { // F1 debug
+      auto comp_check = *session.party_compositor;
+      logs::log(logs::info, "[OVERLAY] F1 key detected — party_compositor={}, has_overlay={}",
+                comp_check ? "SET" : "NULL", (comp_check && comp_check->overlay) ? "YES" : "NO");
+    }
+    auto comp = *session.party_compositor;
+    if (comp && comp->overlay) {
+      auto &ov = *comp->overlay;
+      auto screen = ov.screen.load();
+
+      constexpr short VK_F1 = 0x70;
+      constexpr short VK_F2 = 0x71;
+      constexpr short VK_F3 = 0x72;
+      constexpr short VK_F4 = 0x73;
+      constexpr short VK_F5 = 0x74;
+      constexpr short SC_F1 = 0x3B;
+      constexpr short SC_F2 = 0x3C;
+      constexpr short SC_F3 = 0x3D;
+      constexpr short SC_F4 = 0x3E;
+      constexpr short SC_F5 = 0x3F;
+      constexpr short VK_ESCAPE = 0x1B;
+      constexpr short VK_RETURN = 0x0D;
+      constexpr short VK_UP = 0x26;
+      constexpr short VK_DOWN = 0x28;
+      constexpr short VK_LEFT = 0x25;
+      constexpr short VK_RIGHT = 0x27;
+
+      auto key_is = [moonlight_key](short vk, short scan) {
+        return moonlight_key == vk || moonlight_key == scan;
+      };
+
+      // F1: toggle party menu
+      if (key_is(VK_F1, SC_F1)) {
+        logs::log(logs::info, "[OVERLAY] F1 pressed — screen={}, opening party menu", (int)screen);
+        ov.open_party_menu(-1);
+        return;
+      }
+
+      // F2..F5: direct focus switch (slot 1..4)
+      int focus_slot = 0;
+      if (key_is(VK_F2, SC_F2))
+        focus_slot = 1;
+      else if (key_is(VK_F3, SC_F3))
+        focus_slot = 2;
+      else if (key_is(VK_F4, SC_F4))
+        focus_slot = 3;
+      else if (key_is(VK_F5, SC_F5))
+        focus_slot = 4;
+
+      if (focus_slot > 0) {
+        if (ov.on_focus_slot) {
+          ov.on_focus_slot(session.session_id, focus_slot);
+        } else {
+          logs::log(logs::warning,
+                    "[PARTY] Focus hotkey pressed but no focus callback is set (session {}, slot {})",
+                    session.session_id,
+                    focus_slot);
+        }
+        return;
+      }
+
+      // Menu navigation with keyboard (when menu is open)
+      if (screen != streaming::MenuScreen::NONE) {
+        if (moonlight_key == VK_ESCAPE) {
+          if (screen == streaming::MenuScreen::PLAYER_SWAP_CTRL ||
+              screen == streaming::MenuScreen::PLAYER_SWAP_POS) {
+            ov.screen.store(streaming::MenuScreen::PLAYER);
+          } else {
+            ov.dismiss_menu();
+          }
+          return;
+        }
+
+        int item_count = 0;
+        if (screen == streaming::MenuScreen::PLAYER)
+          item_count = streaming::PLAYER_MENU_COUNT;
+        else if (screen == streaming::MenuScreen::PARTY)
+          item_count = streaming::PARTY_MENU_COUNT;
+
+        if (moonlight_key == VK_UP && item_count > 0) { ov.menu_up(item_count); return; }
+        if (moonlight_key == VK_DOWN && item_count > 0) { ov.menu_down(item_count); return; }
+
+        // Enter: same as A button — trigger the selected action
+        if (moonlight_key == VK_RETURN) {
+          int idx = ov.menu_index.load();
+          if (screen == streaming::MenuScreen::PARTY) {
+            if (idx == 0) { bool c = ov.party_global.load(); ov.party_global.store(!c); if (ov.on_toggle_global) ov.on_toggle_global(!c); }
+            else if (idx == 1) { ov.pending_action.store(streaming::MenuAction::UNPAIR_ALL); ov.dismiss_menu(); }
+            else if (idx == 3) { ov.pending_action.store(streaming::MenuAction::END_PARTY); ov.dismiss_menu(); }
+          }
+          return;
+        }
+
+        // Volume: left/right when on volume item in player menu
+        if (screen == streaming::MenuScreen::PLAYER && ov.menu_index.load() == 1) {
+          int slot = ov.triggering_slot.load();
+          if (moonlight_key == VK_LEFT) {
+            std::lock_guard<std::mutex> lock(ov.info_mtx);
+            if (slot - 1 < (int)ov.player_volumes.size())
+              ov.player_volumes[slot - 1] = std::max(0.0f, ov.player_volumes[slot - 1] - 0.1f);
+            return;
+          }
+          if (moonlight_key == VK_RIGHT) {
+            std::lock_guard<std::mutex> lock(ov.info_mtx);
+            if (slot - 1 < (int)ov.player_volumes.size())
+              ov.player_volumes[slot - 1] = std::min(1.0f, ov.player_volumes[slot - 1] + 0.1f);
+            return;
+          }
+        }
+
+        return; // consume all keyboard input while menu is open
+      }
+    }
+  }
+
+  // Virtual keyboard device must exist for normal key passthrough
   if (!session.keyboard->has_value()) {
-    logs::log(logs::warning, "Received KEYBOARD_PACKET but no keyboard device is present");
     return;
   }
 
@@ -564,9 +685,22 @@ void pen(const PEN_PACKET &pkt, events::StreamSession &session) {
 void controller_arrival(const CONTROLLER_ARRIVAL_PACKET &pkt,
                         events::StreamSession &session,
                         immer::box<std::shared_ptr<ENetPeer>> connected_client) {
+  // If a Controller Hub is active, don't create new devices — just track the physical controller
+  if (*session.controller_hub) {
+    int ctrl_num = pkt.controller_number;
+    if (auto comp = *session.party_compositor) {
+      if (comp && comp->overlay) {
+        auto it = comp->overlay->session_ctrl_offsets.find(session.session_id);
+        if (it != comp->overlay->session_ctrl_offsets.end()) ctrl_num += it->second;
+      }
+    }
+    hub_controller_arrival(**session.controller_hub, ctrl_num);
+    return;
+  }
+
+  // Normal flow (no hub)
   auto joypads = session.joypads->load();
   if (joypads->find(pkt.controller_number)) {
-    // TODO: should we replace it instead?
     logs::log(logs::debug,
               "[INPUT] Received CONTROLLER_ARRIVAL for controller {} which is already present; skipping...",
               pkt.controller_number);
@@ -582,6 +716,282 @@ void controller_arrival(const CONTROLLER_ARRIVAL_PACKET &pkt,
 void controller_multi(const CONTROLLER_MULTI_PACKET &pkt,
                       events::StreamSession &session,
                       immer::box<std::shared_ptr<ENetPeer>> connected_client) {
+  // If Controller Hub is active, route through pairing table
+  if (*session.controller_hub) {
+    auto &hub = **session.controller_hub;
+
+    // Apply per-session controller offset to prevent multi-device collisions.
+    // Session A: 0-3, Session B: 100-103, Session C: 200-203.
+    int ctrl_num = pkt.controller_number;
+    if (auto comp = *session.party_compositor) {
+      if (comp && comp->overlay) {
+        auto it = comp->overlay->session_ctrl_offsets.find(session.session_id);
+        if (it != comp->overlay->session_ctrl_offsets.end()) {
+          ctrl_num += it->second;
+        }
+      }
+    }
+
+    // Handle controller departure (Moonlight says this pad is no longer active)
+    if (!(pkt.active_gamepad_mask & (1 << pkt.controller_number))) {
+      hub_controller_departure(hub, ctrl_num);
+      return;
+    }
+
+    // Auto-register controller if first time seen — don't auto-pair, let notifications handle it
+    {
+      std::lock_guard<std::mutex> lock(hub.mtx);
+      if (hub.pairing_table.count(ctrl_num) == 0 &&
+          hub.unpaired_controllers.count(ctrl_num) == 0) {
+        hub.unpaired_controllers.insert(ctrl_num);
+        logs::log(logs::info, "[HUB] Controller {} (session {}) detected — awaiting notification pairing",
+                  ctrl_num, session.session_id);
+      }
+      hub.last_activity[ctrl_num] = std::chrono::steady_clock::now();
+    }
+
+    // ── Overlay system: notifications + menus ──
+    // Only intercept input when overlay is actively showing something.
+    // Paired controllers ALWAYS fall through to input routing below.
+    if (auto comp = *session.party_compositor) {
+      if (comp->overlay) {
+        auto &ov = *comp->overlay;
+
+        // Read pairing state under hub mutex (needed for correct is_paired check)
+        bool is_paired;
+        int ctrl_slot;
+        {
+          std::lock_guard<std::mutex> lock(hub.mtx);
+          is_paired = hub.pairing_table.count(ctrl_num) > 0;
+          ctrl_slot = is_paired ? hub.pairing_table.at(ctrl_num) : -1;
+        }
+
+        // Rising-edge detection — per-hub, not static global
+        std::uint16_t bf = pkt.button_flags;
+        std::uint16_t prev;
+        std::uint16_t stick_pressed;
+        {
+          std::lock_guard<std::mutex> lock(hub.mtx);
+          prev = hub.last_buttons_[ctrl_num];
+          hub.last_buttons_[ctrl_num] = bf;
+
+          // Convert analog stick to digital DPAD bits (with deadzone + rising edge)
+          // Allows stick to navigate menus just like DPAD
+          constexpr std::int16_t STICK_THRESHOLD = 16000; // ~50% deflection
+          std::uint16_t stick_bits = 0;
+          if (pkt.left_stick_y < -STICK_THRESHOLD) stick_bits |= 0x0001; // UP
+          if (pkt.left_stick_y >  STICK_THRESHOLD) stick_bits |= 0x0002; // DOWN
+          if (pkt.left_stick_x < -STICK_THRESHOLD) stick_bits |= 0x0004; // LEFT
+          if (pkt.left_stick_x >  STICK_THRESHOLD) stick_bits |= 0x0008; // RIGHT
+          auto prev_stick = hub.last_stick_digital_[ctrl_num];
+          hub.last_stick_digital_[ctrl_num] = stick_bits;
+          stick_pressed = stick_bits & ~prev_stick; // rising edge only
+        }
+        std::uint16_t pressed = (bf & ~prev) | stick_pressed;
+
+        // ── Notification input (only unpaired controllers) ──
+        if (!is_paired) {
+          int pair_ctrl = -1, pair_slot = -1;
+          bool notif_consumed = false;
+          {
+            std::lock_guard<std::mutex> nlock(ov.notification_mtx);
+            auto *notif = ov.find_notification(ctrl_num);
+            if (notif) {
+              notif->last_input = std::chrono::steady_clock::now();
+              int num_slots = static_cast<int>(ov.players.size());
+              if (num_slots < 1) num_slots = 4;
+
+              if (pressed & 0x0001) { // DPAD_UP
+                notif->selected_slot = notif->selected_slot <= 1 ? num_slots : notif->selected_slot - 1;
+              } else if (pressed & 0x0002) { // DPAD_DOWN
+                notif->selected_slot = notif->selected_slot >= num_slots ? 1 : notif->selected_slot + 1;
+              } else if (pressed & 0x1000) { // A button — confirm pairing
+                pair_ctrl = ctrl_num;
+                pair_slot = notif->selected_slot;
+                notif->confirmed = true;
+                // Remove notification inline (we hold the lock, don't call dismiss_notification)
+                ov.notifications.erase(
+                    std::remove_if(ov.notifications.begin(), ov.notifications.end(),
+                        [cn = ctrl_num](const streaming::DeviceNotification &n) {
+                          return n.controller_number == cn;
+                        }),
+                    ov.notifications.end());
+              }
+              notif_consumed = true;
+            }
+          } // notification_mtx released here
+
+          // Fire pair callback OUTSIDE the notification lock (on_pair acquires hub.mtx)
+          if (pair_ctrl >= 0 && ov.on_pair) {
+            ov.on_pair(pair_ctrl, pair_slot);
+            logs::log(logs::info, "[NOTIFY] Controller {} paired → Slot {} via notification",
+                      pair_ctrl, pair_slot);
+          }
+          if (notif_consumed) return;
+
+          // No notification yet — create one and consume input
+          ov.add_notification(ctrl_num, static_cast<int>(hub.slots.size()));
+          return;
+        }
+
+        // ── Below here: only PAIRED controllers ──
+
+        constexpr std::uint16_t OVERLAY_COMBO_1 = 0x0400 | 0x0100 | 0x0200; // HOME+LB+RB
+        constexpr std::uint16_t OVERLAY_COMBO_2 = 0x0020 | 0x2000 | 0x4000 | 0x1000; // SELECT+B+X+A
+
+        // ── Quick menu combo (either combo works) ──
+        bool combo_hit = ((bf & OVERLAY_COMBO_1) == OVERLAY_COMBO_1 && (pressed & OVERLAY_COMBO_1)) ||
+                         ((bf & OVERLAY_COMBO_2) == OVERLAY_COMBO_2 && (pressed & OVERLAY_COMBO_2));
+        if (combo_hit) {
+          ov.open_player_menu(ctrl_slot, ctrl_num);
+          logs::log(logs::info, "[OVERLAY] Player Menu opened by P{}", ctrl_slot);
+          return;
+        }
+
+        // ── Menu navigation (intercepts ALL controllers while menu is open) ──
+        auto screen = ov.screen.load();
+        if (screen != streaming::MenuScreen::NONE) {
+          int num_players;
+          {
+            std::lock_guard<std::mutex> lock(ov.info_mtx);
+            num_players = static_cast<int>(ov.players.size());
+          }
+          if (num_players < 1) num_players = 4;
+
+          if (screen == streaming::MenuScreen::PLAYER) {
+            // Player menu: 0=Swap, 1=Volume, 2=Reset Game, 3=Party Settings
+            if (pressed & 0x0001) ov.menu_up(streaming::PLAYER_MENU_COUNT);       // DPAD_UP
+            else if (pressed & 0x0002) ov.menu_down(streaming::PLAYER_MENU_COUNT); // DPAD_DOWN
+            else if (pressed & 0x1000) { // A
+              int idx = ov.menu_index.load();
+              if (idx == 0) { // Swap → pick target
+                ov.submenu_index.store(ctrl_slot == 1 ? 2 : 1);
+                ov.screen.store(streaming::MenuScreen::PLAYER_SWAP_CTRL);
+              } else if (idx == 2) { // Reset Game
+                ov.action_param_a.store(ctrl_slot);
+                ov.pending_action.store(streaming::MenuAction::RESTART_GAME);
+                ov.dismiss_menu();
+              } else if (idx == 3) { // Party Settings
+                ov.menu_index.store(0);
+                ov.screen.store(streaming::MenuScreen::PARTY);
+              }
+            }
+            else if (pressed & 0x2000) ov.dismiss_menu(); // B
+            // Volume (idx 1): left/right adjusts when selected
+            else if (ov.menu_index.load() == 1) {
+              if (pressed & 0x0004) { // DPAD_LEFT → volume down
+                std::lock_guard<std::mutex> lock(ov.info_mtx);
+                if (ctrl_slot - 1 < (int)ov.player_volumes.size()) {
+                  ov.player_volumes[ctrl_slot - 1] = std::max(0.0f, ov.player_volumes[ctrl_slot - 1] - 0.1f);
+                }
+              } else if (pressed & 0x0008) { // DPAD_RIGHT → volume up
+                std::lock_guard<std::mutex> lock(ov.info_mtx);
+                if (ctrl_slot - 1 < (int)ov.player_volumes.size()) {
+                  ov.player_volumes[ctrl_slot - 1] = std::min(1.0f, ov.player_volumes[ctrl_slot - 1] + 0.1f);
+                }
+              }
+            }
+
+          } else if (screen == streaming::MenuScreen::PLAYER_SWAP_CTRL ||
+                     screen == streaming::MenuScreen::PLAYER_SWAP_POS) {
+            // Submenu: pick target player to swap with
+            int target = ov.submenu_index.load();
+            if (pressed & 0x0001) { // DPAD_UP
+              target = target <= 1 ? num_players : target - 1;
+              if (target == ctrl_slot) target = target <= 1 ? num_players : target - 1; // skip self
+              ov.submenu_index.store(target);
+            } else if (pressed & 0x0002) { // DPAD_DOWN
+              target = target >= num_players ? 1 : target + 1;
+              if (target == ctrl_slot) target = target >= num_players ? 1 : target + 1; // skip self
+              ov.submenu_index.store(target);
+            } else if (pressed & 0x1000) { // A → confirm swap
+              ov.action_param_a.store(ctrl_slot);
+              ov.action_param_b.store(target);
+              if (screen == streaming::MenuScreen::PLAYER_SWAP_CTRL) {
+                ov.pending_action.store(streaming::MenuAction::SWAP_CONTROLLERS);
+              } else {
+                ov.pending_action.store(streaming::MenuAction::SWAP_POSITION);
+              }
+              ov.dismiss_menu();
+            } else if (pressed & 0x2000) { // B → back to player menu
+              ov.screen.store(streaming::MenuScreen::PLAYER);
+            }
+
+          } else if (screen == streaming::MenuScreen::PARTY) {
+            // Party menu: 0=Global/Private, 1=Unpair All, 2=Restart Party, 3=End Party
+            if (pressed & 0x0001) ov.menu_up(streaming::PARTY_MENU_COUNT);
+            else if (pressed & 0x0002) ov.menu_down(streaming::PARTY_MENU_COUNT);
+            else if (pressed & 0x1000) { // A
+              int idx = ov.menu_index.load();
+              if (idx == 0) { // Toggle Global/Private
+                bool current = ov.party_global.load();
+                ov.party_global.store(!current);
+                if (ov.on_toggle_global) ov.on_toggle_global(!current);
+              } else if (idx == 1) { // Unpair All
+                ov.pending_action.store(streaming::MenuAction::UNPAIR_ALL);
+                ov.dismiss_menu();
+              } else if (idx == 3) { // End Party
+                ov.pending_action.store(streaming::MenuAction::END_PARTY);
+                ov.dismiss_menu();
+              }
+              // idx 2 (Restart Party) = not implemented yet
+            }
+            else if (pressed & 0x2000) ov.dismiss_menu(); // B
+          }
+          return; // ALL input consumed while menu is open
+        }
+        // Paired controller, no menu open → fall through to input routing
+      }
+    }
+
+    // ── Update overlay with live input state for button visualization ──
+    if (auto comp = *session.party_compositor) {
+      if (comp->overlay) {
+        std::lock_guard<std::mutex> lock(comp->overlay->info_mtx);
+        // Find the player slot for this controller
+        int slot = -1;
+        {
+          std::lock_guard<std::mutex> hlock(hub.mtx);
+          auto it = hub.pairing_table.find(ctrl_num);
+          if (it != hub.pairing_table.end()) slot = it->second;
+        }
+        if (slot >= 1 && slot <= (int)comp->overlay->players.size()) {
+          auto &p = comp->overlay->players[slot - 1];
+          p.buttons = pkt.button_flags;
+          p.left_stick_x = pkt.left_stick_x;
+          p.left_stick_y = pkt.left_stick_y;
+          p.right_stick_x = pkt.right_stick_x;
+          p.right_stick_y = pkt.right_stick_y;
+          p.left_trigger = pkt.left_trigger;
+          p.right_trigger = pkt.right_trigger;
+        }
+      }
+    }
+
+    // ── Route input to paired virtual device ──
+    auto paired_device = get_paired_device(hub, ctrl_num);
+    if (paired_device) {
+      std::visit(
+          [pkt, &session](inputtino::Joypad &pad) {
+            std::uint16_t bf = pkt.button_flags;
+            std::uint32_t bf2 = pkt.buttonFlags2;
+            auto pressed_buttons = bf | (bf2 << 16);
+            if (pressed_buttons & inputtino::Joypad::START && pressed_buttons & inputtino::Joypad::DPAD_UP &&
+                pressed_buttons & inputtino::Joypad::RIGHT_BUTTON) {
+              session.event_bus->fire_event(immer::box<events::ClientWolfUIComboEvent>{
+                  events::ClientWolfUIComboEvent{.session_id = session.session_id}});
+            }
+            pad.set_pressed_buttons(pressed_buttons);
+            pad.set_stick(inputtino::Joypad::LS, pkt.left_stick_x, pkt.left_stick_y);
+            pad.set_stick(inputtino::Joypad::RS, pkt.right_stick_x, pkt.right_stick_y);
+            pad.set_triggers(pkt.left_trigger, pkt.right_trigger);
+          },
+          *paired_device);
+    }
+    return;
+  }
+
+  // Normal flow (no hub) — unchanged from upstream
   auto joypads = session.joypads->load();
   std::shared_ptr<events::JoypadTypes> selected_pad;
   if (auto joypad = joypads->find(pkt.controller_number)) {
@@ -590,7 +1000,6 @@ void controller_multi(const CONTROLLER_MULTI_PACKET &pkt,
     // Check if Moonlight is sending the final packet for this pad
     if (!(pkt.active_gamepad_mask & (1 << pkt.controller_number))) {
       logs::log(logs::debug, "Removing joypad {}", pkt.controller_number);
-      // Send the event downstream, Docker will pick it up and remove the device
       events::UnplugDeviceEvent unplug_ev{.session_id = std::to_string(session.session_id)};
       std::visit(
           [&unplug_ev](auto &pad) {
@@ -599,12 +1008,9 @@ void controller_multi(const CONTROLLER_MULTI_PACKET &pkt,
           },
           *selected_pad);
       session.event_bus->fire_event(immer::box<events::UnplugDeviceEvent>(unplug_ev));
-
-      // Remove the joypad, this will delete the last reference
       session.joypads->update([&](events::JoypadList joypads) { return joypads.erase(pkt.controller_number); });
     }
   } else {
-    // Old Moonlight doesn't support CONTROLLER_ARRIVAL, we create a default pad when it's first mentioned
     selected_pad = create_new_joypad(session, connected_client, pkt.controller_number, XBOX, ANALOG_TRIGGERS | RUMBLE);
   }
   if (selected_pad) {
@@ -613,7 +1019,6 @@ void controller_multi(const CONTROLLER_MULTI_PACKET &pkt,
           std::uint16_t bf = pkt.button_flags;
           std::uint32_t bf2 = pkt.buttonFlags2;
           auto pressed_buttons = bf | (bf2 << 16);
-          // Check for our special WOLF-UI combo (START + UP + RB)
           if (pressed_buttons & inputtino::Joypad::START && pressed_buttons & inputtino::Joypad::DPAD_UP &&
               pressed_buttons & inputtino::Joypad::RIGHT_BUTTON) {
             session.event_bus->fire_event(immer::box<events::ClientWolfUIComboEvent>{
